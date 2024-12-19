@@ -4,6 +4,9 @@ import docker
 import json
 import platform
 import traceback
+import math
+import os
+import time
 
 if platform.system() == 'Linux':
     import resource
@@ -65,6 +68,176 @@ class EvaluationError(Exception):
         )
 
 
+# D* Suspiciousness Computation Functions
+def compute_dstar_suspiciousness(coverage_matrix, test_results, star_power=2):
+    """
+    Compute D* suspiciousness scores for program statements
+
+    Args:
+        coverage_matrix: 2D array where coverage_matrix[i][j] indicates if test i covered statement j
+        test_results: Array where test_results[i] is 1 if test i failed, 0 if passed
+        star_power: The * value in D* (default=2)
+
+    Returns:
+        Array of suspiciousness scores for each statement
+    """
+    if not coverage_matrix:
+        return []
+    num_statements = len(coverage_matrix[0])
+    suspiciousness = []
+
+    for stmt in range(num_statements):
+        ncf = nuf = ncs = 0  # Initialize counters
+        for test in range(len(test_results)):
+            if coverage_matrix[test][stmt] == 1:  # Statement covered by test
+                if test_results[test] == 1:  # Test failed
+                    ncf += 1
+                else:
+                    ncs += 1
+            elif test_results[test] == 1:  # Not covered, test failed
+                nuf += 1
+
+        # Compute D* score
+        if (nuf + ncs) == 0:
+            score = 0
+        else:
+            score = math.pow(ncf, star_power) / (nuf + ncs)
+
+        suspiciousness.append(score)
+
+    return suspiciousness
+
+
+def rank_statements(suspiciousness):
+    """
+    Rank statements by suspiciousness score from highest to lowest
+
+    Args:
+        suspiciousness: Array of suspiciousness scores
+
+    Returns:
+        Array of statement indices sorted by descending suspiciousness
+    """
+    ranked = sorted(enumerate(suspiciousness), key=lambda x: x[1], reverse=True)
+    return [idx for idx, _ in ranked]
+
+
+def extract_test_results_from_output(test_output, logger):
+    """
+    Parses test output to extract test results.
+
+    Args:
+        test_output: The output from running the tests.
+        logger: Logger for logging messages.
+
+    Returns:
+        Dictionary mapping test names to pass/fail (0 for pass, 1 for fail)
+    """
+    test_results = {}
+    try:
+        lines = test_output.split("\n")
+        collecting_tests = False
+        for line in lines:
+            line = line.strip()
+            if line.startswith("collected"):
+                collecting_tests = True
+                continue
+            if collecting_tests:
+                if line.startswith("test_"):
+                    parts = line.split()
+                    test_name = parts[0]
+                    # Determine if passed or failed
+                    result = 1
+                    for p in parts:
+                        if p == "PASSED":
+                            result = 0
+                            break
+                        elif p == "FAILED":
+                            result = 1
+                            break
+                    test_results[test_name] = result
+                elif line.startswith("=" * 10):
+                    collecting_tests = False
+        return test_results
+    except Exception as e:
+        logger.error(f"Error extracting test results: {str(e)}")
+        return {}
+
+
+def extract_coverage_matrix_and_test_results(
+    coverage_data, test_results_dict, logger
+):
+    """
+    Extracts the coverage matrix and test results from coverage data with contexts.
+
+    Args:
+        coverage_data: The parsed coverage.json data.
+        test_results_dict: Dictionary of test results (0 for pass, 1 for fail)
+        logger: Logger for logging messages.
+
+    Returns:
+        Tuple of (coverage_matrix, test_results)
+    """
+    try:
+        files = coverage_data.get("files", {})
+        statements = set()
+        contexts = list(test_results_dict.keys())
+
+        for file_data in files.values():
+            executed = file_data.get("executed_lines", [])
+            missing = file_data.get("missing_lines", [])
+            statements.update(map(int, executed))
+            statements.update(map(int, missing))
+
+        statements = sorted(statements)
+        stmt_to_index = {stmt: idx for idx, stmt in enumerate(statements)}
+        context_to_index = {ctx: idx for idx, ctx in enumerate(contexts)}
+        coverage_matrix = [[0] * len(statements) for _ in range(len(contexts))]
+        test_results = [0] * len(contexts)
+
+        for file_data in files.values():
+            for context_name, context_data in file_data.get("contexts", {}).items():
+                if context_name not in context_to_index:
+                    continue
+                ctx_idx = context_to_index[context_name]
+                test_results[ctx_idx] = test_results_dict.get(context_name, 1)
+                for line in context_data.get('executed_lines', []):
+                    stmt_idx = stmt_to_index.get(int(line))
+                    if stmt_idx is not None:
+                        coverage_matrix[ctx_idx][stmt_idx] = 1
+
+        return coverage_matrix, test_results
+    except Exception as e:
+        logger.error(f"Error extracting coverage data: {str(e)}")
+        return None, None
+
+
+def compute_dstar_from_coverage(coverage_file_path, test_results_dict, logger):
+    """
+    Parses coverage.json to compute D* suspiciousness scores.
+    """
+    try:
+        with open(coverage_file_path, "r") as f:
+            coverage_data = json.load(f)
+    except Exception as e:
+        logger.error(f"Error reading coverage data: {str(e)}")
+        return None, None
+
+    coverage_matrix, test_results = extract_coverage_matrix_and_test_results(
+        coverage_data, test_results_dict, logger
+    )
+
+    if coverage_matrix is not None and test_results is not None:
+        suspiciousness_scores = compute_dstar_suspiciousness(
+            coverage_matrix, test_results
+        )
+        ranked_statements = rank_statements(suspiciousness_scores)
+        return suspiciousness_scores, ranked_statements
+    else:
+        logger.error("Coverage matrix or test results are empty.")
+        return None, None
+
+
 def run_instance(
         test_spec: TestSpec,
         pred: dict,
@@ -75,7 +248,7 @@ def run_instance(
         timeout: int | None = None,
     ):
     """
-    Run a single instance with the given prediction.
+    Run a single instance with the given prediction, including D* suspiciousness computation.
 
     Args:
         test_spec (TestSpec): TestSpec instance
@@ -86,7 +259,6 @@ def run_instance(
         run_id (str): Run ID
         timeout (int): Timeout for running tests
     """
-    # Set up logging directory
     instance_id = test_spec.instance_id
     model_name_or_path = pred.get(KEY_MODEL, "None").replace("/", "__")
     log_dir = RUN_EVALUATION_LOG_DIR / run_id / model_name_or_path / instance_id
@@ -97,10 +269,8 @@ def run_instance(
     image_build_link = log_dir / "image_build_dir"
     if not image_build_link.exists():
         try:
-            # link the image build dir in the log dir
             image_build_link.symlink_to(build_dir.absolute(), target_is_directory=True)
         except:
-            # some error, idk why
             pass
     log_file = log_dir / LOG_INSTANCE
 
@@ -110,16 +280,15 @@ def run_instance(
         return instance_id, json.loads(report_path.read_text())
     logger = setup_logger(instance_id, log_file)
 
-    # Run the instance
     container = None
     try:
-        # Build + start instance container (instance image should already be built)
+        # Build + start instance container
         container = build_container(test_spec, client, run_id, logger, rm_image, force_rebuild)
         container.start()
         logger.info(f"Container for {instance_id} started: {container.id}")
 
         # Copy model prediction as patch file to container
-        patch_file = Path(log_dir / "patch.diff")
+        patch_file = log_dir / "patch.diff"
         patch_file.write_text(pred[KEY_PREDICTION] or "")
         logger.info(
             f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container..."
@@ -134,8 +303,6 @@ def run_instance(
         )
         if val.exit_code != 0:
             logger.info(f"Failed to apply patch to container, trying again...")
-            
-            # try "patch --batch --fuzz=5 -p1 -i {patch_path}" to try again
             val = container.exec_run(
                 f"patch --batch --fuzz=5 -p1 -i {DOCKER_PATCH}",
                 workdir=DOCKER_WORKDIR,
@@ -159,12 +326,24 @@ def run_instance(
         )
         logger.info(f"Git diff before:\n{git_diff_output_before}")
 
-        eval_file = Path(log_dir / "eval.sh")
-        eval_file.write_text(test_spec.eval_script)
+        eval_file = log_dir / "eval.sh"
+        eval_sh_content = """#!/bin/bash
+# Install necessary packages
+pip install --no-cache-dir coverage pytest pytest-cov
+
+# Run tests with coverage and context tracking
+coverage erase
+coverage run --context=test --branch -m pytest tests/
+coverage json -o coverage.json
+"""
+        eval_file.write_text(eval_sh_content)
         logger.info(
             f"Eval script for {instance_id} written to {eval_file}; copying to container..."
         )
         copy_to_container(container, eval_file, Path("/eval.sh"))
+
+        # Make eval.sh executable
+        container.exec_run("chmod +x /eval.sh", workdir=DOCKER_WORKDIR, user=DOCKER_USER)
 
         # Run eval script, write output to logs
         test_output, timed_out, total_runtime = exec_run_with_timeout(container, "/bin/bash /eval.sh", timeout)
@@ -181,12 +360,46 @@ def run_instance(
                     logger,
                 )
 
+        # Copy coverage data from container
+        coverage_file_host = log_dir / "coverage.json"
+        coverage_file_container = PurePosixPath(DOCKER_WORKDIR) / "coverage.json"
+        bits, stat = container.get_archive(str(coverage_file_container))
+        with open(coverage_file_host, "wb") as f:
+            for chunk in bits:
+                f.write(chunk)
+        logger.info(f"Coverage data copied to {coverage_file_host}")
+
+        # Extract test results from test output
+        test_results = extract_test_results_from_output(test_output, logger)
+        if not test_results:
+            logger.error("No test results extracted.")
+
+        # Compute D* suspiciousness scores
+        suspiciousness_scores, ranked_statements = compute_dstar_from_coverage(
+            coverage_file_host, test_results, logger
+        )
+
+        # Save D* scores as JSON
+        dstar_report_path = log_dir / "dstar_report.json"
+        dstar_data = {
+            "suspiciousness_scores": suspiciousness_scores if suspiciousness_scores else [],
+            "ranked_statements": ranked_statements if ranked_statements else []
+        }
+        with open(dstar_report_path, "w") as dstar_f:
+            json.dump(dstar_data, dstar_f, indent=4)
+
+        if suspiciousness_scores:
+            logger.info("D* Suspiciousness Scores computed successfully.")
+            logger.info("Top 10 ranked statements by suspiciousness:")
+            for idx in ranked_statements[:10]:
+                logger.info(f"Statement {idx}: Score = {suspiciousness_scores[idx]}")
+        else:
+            logger.error(f"Failed to compute D* suspiciousness scores for {instance_id}.")
+
         # Get git diff after running eval script
         git_diff_output_after = (
             container.exec_run("git diff", workdir=DOCKER_WORKDIR).output.decode(UTF8).strip()
         )
-
-        # Check if git diff changed after running eval script
         logger.info(f"Git diff after:\n{git_diff_output_after}")
         if git_diff_output_after != git_diff_output_before:
             logger.info(f"Git diff changed after running eval script")
@@ -240,23 +453,9 @@ def run_instances(
         run_id: str,
         timeout: int,
     ):
-    """
-    Run all instances for the given predictions in parallel.
-
-    Args:
-        predictions (dict): Predictions dict generated by the model
-        instances (list): List of instances
-        cache_level (str): Cache level
-        clean (bool): Clean images above cache level
-        force_rebuild (bool): Force rebuild images
-        max_workers (int): Maximum number of workers
-        run_id (str): Run ID
-        timeout (int): Timeout for running tests
-    """
     client = docker.from_env()
     test_specs = list(map(make_test_spec, instances))
 
-    # print number of existing instance images
     instance_image_ids = {x.instance_image_key for x in test_specs}
     existing_images = {
         tag for i in client.images.list(all=True)
@@ -265,11 +464,9 @@ def run_instances(
     if not force_rebuild and len(existing_images):
         print(f"Found {len(existing_images)} existing instance images. Will reuse them.")
 
-    # run instances in parallel
     print(f"Running {len(instances)} instances...")
     with tqdm(total=len(instances), smoothing=0) as pbar:
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Create a future for running each instance
             futures = {
                 executor.submit(
                     run_instance,
@@ -288,11 +485,9 @@ def run_instances(
                 ): None
                 for test_spec in test_specs
             }
-            # Wait for each future to complete
             for future in as_completed(futures):
                 pbar.update(1)
                 try:
-                    # Update progress bar, check if instance ran successfully
                     future.result()
                 except Exception as e:
                     traceback.print_exc()
@@ -308,22 +503,14 @@ def get_dataset_from_preds(
         run_id: str,
         exclude_completed: bool = True
     ):
-    """
-    Return only instances that have predictions and are in the dataset.
-    If instance_ids is provided, only return instances with those IDs.
-    If exclude_completed is True, only return instances that have not been run yet.
-    """
-    # load dataset
     dataset = load_swebench_dataset(dataset_name, split)
     dataset_ids = {i[KEY_INSTANCE_ID] for i in dataset}
 
     if instance_ids:
-        # check that all instance IDs have predictions
         missing_preds = set(instance_ids) - set(predictions.keys())
         if missing_preds:
             print(f"Warning: Missing predictions for {len(missing_preds)} instance IDs.")
     
-    # check that all prediction IDs are in the dataset
     prediction_ids = set(predictions.keys())
     if prediction_ids - dataset_ids:
         raise ValueError(
@@ -335,11 +522,9 @@ def get_dataset_from_preds(
     if instance_ids:
         dataset = [i for i in dataset if i[KEY_INSTANCE_ID] in instance_ids]
 
-    # check which instance IDs have already been run
     completed_ids = set()
     for instance in dataset:
         if instance[KEY_INSTANCE_ID] not in prediction_ids:
-            # skip instances without predictions
             continue
         prediction = predictions[instance[KEY_INSTANCE_ID]]
         report_file = (
@@ -353,13 +538,10 @@ def get_dataset_from_preds(
             completed_ids.add(instance[KEY_INSTANCE_ID])
 
     if completed_ids and exclude_completed:
-        # filter dataset to only instances that have not been run
         print(f"{len(completed_ids)} instances already run, skipping...")
         dataset = [i for i in dataset if i[KEY_INSTANCE_ID] not in completed_ids]
 
     empty_patch_ids = {k for k, v in predictions.items() if v[KEY_PREDICTION] == "" or v[KEY_PREDICTION] is None}
-
-    # filter dataset to only instances with predictions
     dataset = [i for i in dataset if i[KEY_INSTANCE_ID] in prediction_ids and i[KEY_INSTANCE_ID] not in empty_patch_ids]
     return dataset
 
@@ -370,20 +552,6 @@ def make_run_report(
         client: docker.DockerClient,
         run_id: str
     ) -> Path:
-    """
-    Make a final evaluation and run report of the instances that have been run.
-    Also reports on images and containers that may still running!
-
-    Args:
-        predictions (dict): Predictions dict generated by the model
-        full_dataset (list): List of all instances
-        client (docker.DockerClient): Docker client
-        run_id (str): Run ID
-    
-    Returns:
-        Path to report file
-    """
-    # instantiate sets to store IDs of different outcomes
     completed_ids = set()
     resolved_ids = set()
     error_ids = set()
@@ -391,14 +559,11 @@ def make_run_report(
     unremoved_images = set()
     unresolved_ids = set()
     incomplete_ids = set()
-    # get instances with empty patches
     empty_patch_ids = set()
 
-    # iterate through dataset and check if the instance has been run
     for instance in full_dataset:
         instance_id = instance[KEY_INSTANCE_ID]
         if instance_id not in predictions:
-            # skip instances without 
             incomplete_ids.add(instance_id)
             continue
         prediction = predictions[instance_id]
@@ -413,19 +578,15 @@ def make_run_report(
             / LOG_REPORT
         )
         if report_file.exists():
-            # If report file exists, then the instance has been run
             completed_ids.add(instance_id)
             report = json.loads(report_file.read_text())
             if report[instance_id]["resolved"]:
-                # Record if the instance was resolved
                 resolved_ids.add(instance_id)
             else:
                 unresolved_ids.add(instance_id)
         else:
-            # Otherwise, the instance was not run successfully
             error_ids.add(instance_id)
 
-    # get remaining images and containers
     images = list_images(client)
     test_specs = list(map(make_test_spec, full_dataset))
     for spec in test_specs:
@@ -433,11 +594,10 @@ def make_run_report(
         if image_name in images:
             unremoved_images.add(image_name)
     containers = client.containers.list(all=True)
-    for container in containers:
-        if run_id in container.name:
-            unstopped_containers.add(container.name)
+    for c in containers:
+        if run_id in c.name:
+            unstopped_containers.add(c.name)
 
-    # print final report
     dataset_ids = {i[KEY_INSTANCE_ID] for i in full_dataset}
     print(f"Total instances: {len(full_dataset)}")
     print(f"Instances submitted: {len(set(predictions.keys()) & dataset_ids)}")
@@ -450,7 +610,6 @@ def make_run_report(
     print(f"Unstopped containers: {len(unstopped_containers)}")
     print(f"Unremoved images: {len(unremoved_images)}")
 
-    # write report to file
     report = {
         "total_instances": len(full_dataset),
         "submitted_instances": len(predictions),
@@ -483,9 +642,6 @@ def make_run_report(
 
 
 def get_gold_predictions(dataset_name: str, split: str):
-    """
-    Get gold predictions for the given dataset and split.
-    """
     dataset = load_swebench_dataset(dataset_name, split)
     return [
         {
@@ -509,16 +665,11 @@ def main(
         run_id: str,
         timeout: int,
     ):
-    """
-    Run evaluation harness for the given dataset and predictions.
-    """
-    # set open file limit
     assert len(run_id) > 0, "Run ID must be provided"
     if platform.system() == 'Linux':
         resource.setrlimit(resource.RLIMIT_NOFILE, (open_file_limit, open_file_limit))
     client = docker.from_env()
 
-    # load predictions as map of instance_id to prediction
     if predictions_path == 'gold':
         print("Using gold predictions - ignoring predictions_path")
         predictions = get_gold_predictions(dataset_name, split)
@@ -533,7 +684,6 @@ def main(
             raise ValueError("Predictions path must be \"gold\", .json, or .jsonl")
     predictions = {pred[KEY_INSTANCE_ID]: pred for pred in predictions}
 
-    # get dataset from predictions
     dataset = get_dataset_from_preds(dataset_name, split, instance_ids, predictions, run_id)
     full_dataset = load_swebench_dataset(dataset_name, split, instance_ids)
     existing_images = list_images(client)
@@ -541,11 +691,9 @@ def main(
     if not dataset:
         print("No instances to run.")
     else:
-        # build environment images + run instances
         build_env_images(client, dataset, force_rebuild, max_workers)
         run_instances(predictions, dataset, cache_level, clean, force_rebuild, max_workers, run_id, timeout)
 
-    # clean images + make final report
     clean_images(client, existing_images, cache_level, clean)
     make_run_report(predictions, full_dataset, client, run_id)
 
@@ -558,25 +706,13 @@ if __name__ == "__main__":
     parser.add_argument("--predictions_path", type=str, help="Path to predictions file - if 'gold', uses gold predictions", required=True)
     parser.add_argument("--max_workers", type=int, default=4, help="Maximum number of workers (should be <= 75%% of CPU cores)")
     parser.add_argument("--open_file_limit", type=int, default=4096, help="Open file limit")
-    parser.add_argument(
-        "--timeout", type=int, default=1_800, help="Timeout (in seconds) for running tests for each instance"
-        )
-    parser.add_argument(
-        "--force_rebuild", type=str2bool, default=False, help="Force rebuild of all images"
-    )
-    parser.add_argument(
-        "--cache_level",
-        type=str,
-        choices=["none", "base", "env", "instance"],
-        help="Cache level - remove images above this level",
-        default="env",
-    )
-    # if clean is true then we remove all images that are above the cache level
-    # if clean is false, we only remove images above the cache level if they don't already exist
-    parser.add_argument(
-        "--clean", type=str2bool, default=False, help="Clean images above cache level"
-    )
+    parser.add_argument("--timeout", type=int, default=1800, help="Timeout (in seconds) for running tests for each instance")
+    parser.add_argument("--force_rebuild", type=str2bool, default=False, help="Force rebuild of all images")
+    parser.add_argument("--cache_level", type=str, choices=["none", "base", "env", "instance"], default="env",
+                        help="Cache level - remove images above this level")
+    parser.add_argument("--clean", type=str2bool, default=False, help="Clean images above cache level")
     parser.add_argument("--run_id", type=str, required=True, help="Run ID - identifies the run")
     args = parser.parse_args()
 
     main(**vars(args))
+
